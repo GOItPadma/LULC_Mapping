@@ -1,0 +1,702 @@
+// -------------- This code is part of the research ------------
+// titled "Evaluating Machine Learning Algorithms for Classifying Urban Heterogeneous Landscape Using GEE -----------------------//
+
+//////////////////////  CLOUD MASKING AND GAP FILLING FUNCTIONS   ///////////
+
+// Landsat 8
+function prepSrL8(image) {
+  // Develop masks for unwanted pixels (fill, cloud, cloud shadow).
+  var qaMask = image.select('QA_PIXEL').bitwiseAnd(parseInt('11111', 2)).eq(0);
+  var saturationMask = image.select('QA_RADSAT').eq(0);
+
+  // Apply the scaling factors to the appropriate bands.
+  var getFactorImg = function(factorNames) {
+    var factorList = image.toDictionary().select(factorNames).values();
+    return ee.Image.constant(factorList);
+  };
+  var scaleImg = getFactorImg([
+    'REFLECTANCE_MULT_BAND_.|TEMPERATURE_MULT_BAND_ST_B10']);
+  var offsetImg = getFactorImg([
+    'REFLECTANCE_ADD_BAND_.|TEMPERATURE_ADD_BAND_ST_B10']);
+  var scaled = image.select('SR_B.|ST_B10').multiply(scaleImg).add(offsetImg);
+
+  // Replace original bands with scaled bands and apply masks.
+  return image.addBands(scaled, null, true)
+    .updateMask(qaMask).updateMask(saturationMask).clip(aoi);
+}
+
+// Landsat 5
+function prepSr(image) {
+  // Develop masks for unwanted pixels (fill, cloud, cloud shadow).
+  var qaMask = image.select('QA_PIXEL').bitwiseAnd(parseInt('11111', 2)).eq(0);
+  var saturationMask = image.select('QA_RADSAT').eq(0);
+
+  // Apply the scaling factors to the appropriate bands.
+  var getFactorImg = function(factorNames) {
+    var factorList = image.toDictionary().select(factorNames).values();
+    return ee.Image.constant(factorList);
+  };
+  var scaleImg = getFactorImg([
+    'REFLECTANCE_MULT_BAND_.|TEMPERATURE_MULT_BAND_ST_B6']);
+  var offsetImg = getFactorImg([
+    'REFLECTANCE_ADD_BAND_.|TEMPERATURE_ADD_BAND_ST_B6']);
+  var scaled = image.select('SR_B.|ST_B6').multiply(scaleImg).add(offsetImg);
+
+  // Replace original bands with scaled bands and apply masks.
+  return image.addBands(scaled, null, true)
+    .updateMask(qaMask).updateMask(saturationMask).clip(aoi);
+}
+
+
+//////////////////////   LOADING THE LANDSAT DATA    ///////////////////
+
+var l8 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+.filterDate('2021-1-01', '2021-12-31')
+.filterBounds(aoi)
+.map(prepSrL8)
+.select('SR.B.*')
+
+var l5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+.filterDate('2011-01-01', '2011-12-31').filterBounds(aoi)
+.map(prepSr)
+.select('SR_B.*')
+
+// Defining the Land Cover Color Palette
+var landcoverPalette = [
+  '#0c2c84', //waterbody
+  '#e31a1c', //built-up 
+  '#1AB12A', //green space 
+'#ffd800',//cropland(3)
+  '#006666',// wetland (4)
+  '#D8D9D7' //barren (5)
+  ];
+
+
+//////////////////////   CALCULATING THE NORMALIZED DIFFERENCE INDICES   ////////
+
+// Landsat 8
+var ndwi = l8.map(function(img){return img.normalizedDifference(['SR_B3', 'SR_B5']).rename('NDWI')});
+var ndvi = l8.map(function(img){return img.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI')})
+var ndbi = l8.map(function(img){return img.normalizedDifference(['SR_B6', 'SR_B5']).rename('NDBI')});
+
+// Landsat 5
+var ndwi = l5.map(function(img){return img.normalizedDifference(['SR_B2', 'SR_B4']).rename('NDWI')});
+var ndvi = l5.map(function(img){return img.normalizedDifference(['SR_B4', 'SR_B3']).rename('NDVI')})
+var ndbi = l5.map(function(img){return img.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDBI')});
+
+var label = 'Class';
+
+///////////////////////   PREPARING THE INPUT DATASET   ////////////////
+
+// Band Names of Landsat 8
+var bands_l8 = [ 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5','SR_B6','SR_B7','NDBI','NDVI','NDWI'];
+
+// Band Names of Landsat 5
+var bands_l5 = [ 'SR_B1','SR_B2', 'SR_B3', 'SR_B4', 'SR_B5','SR_B7','NDBI',"NDVI","NDWI"];
+
+// Final Input Dataset as Median (Change l5 or l8 as per the landsat image)
+var input = ee.Image.cat(l5.median(),ndbi.median(),ndvi.median(),ndwi.median());
+
+
+///////////////////////   PREPARING THE TRAINING, VALIDATION AND TESTING DATA   ////////////////
+
+// Splitting the Training Sample (Polygons) into 80:20 Ratio
+var sample = training.randomColumn();
+var trainingSample = sample.filter('random <= 0.8');
+var validationSample = sample.filter('random > 0.8');
+
+// Generating the Training and Validation Images
+var trainImage = input.sampleRegions({
+  collection: trainingSample,
+  properties: [label],
+  scale: 30
+});
+
+var validationImage = input.sampleRegions({
+  collection: validationSample,
+  properties: [label],
+  scale: 30
+});
+
+// Generating the Testing Images (Points)
+var testImage=input.sampleRegions({
+  collection: test,
+  properties: [label],
+  scale: 30
+});
+
+
+//////////////////////    RF CLASSIFIER   ///////////////////////
+
+//// Tuning Hyperparameter //// 
+
+// Defiing the parameters
+var maxN=ee.List.sequence(2,100,1)
+
+// Getting the Results of Grid Search
+var results_rf=maxN.map(function(e){
+var rf={
+  numberOfTrees:500,
+  variablesPerSplit:2,
+  seed:123,
+  maxNodes:e
+}
+var rf_classifier = ee.Classifier.smileRandomForest(rf)
+    .train({
+      features: trainImage,
+      classProperty: label,
+      inputProperties: bands
+    });
+
+var rf_classified = input.classify(rf_classifier);
+
+var confusionMatrix_train = ee.ConfusionMatrix(trainImage.classify(rf_classifier)
+    .errorMatrix({
+      actual: 'Class', 
+      predicted: 'classification'
+    }));
+var confusionMatrix_val = ee.ConfusionMatrix(validationImage.classify(rf_classifier)
+    .errorMatrix({
+      actual: 'Class', 
+      predicted: 'classification'
+    }));    
+return ee.Dictionary({'maximum nodes':e,'accuracy_val':confusionMatrix_val.accuracy(),'accuracy_train':confusionMatrix_train.accuracy()});
+}).flatten()
+
+function extr_val(d,k){return d.values([k]).get(0)}
+
+// Visualizing the Accuracy Results according to Maxnodes
+var acc_train=results_rf.map(function(e){
+  var d=ee.Dictionary(e)
+  return extr_val(d,'accuracy_train')
+})
+var acc_val=results_rf.map(function(e){
+  var d=ee.Dictionary(e)
+  return extr_val(d,'accuracy_val')
+})
+var acc=ee.Array([acc_train,acc_val])
+var nodes=results_rf.map(function(e){
+  var d=ee.Dictionary(e)
+  return extr_val(d,'maximum nodes')
+})
+var chart = ui.Chart.array.values({array: acc, axis: 1, xLabels: nodes})
+.setChartType('LineChart')
+.setSeriesNames(['Train','Validation'])
+.setOptions({
+  title: 'Nodes and Accuracy',
+  hAxis: {
+    title: 'Nodes',
+    titleTextStyle: {italic: false, bold: true}
+  },
+  vAxis: {
+    title: 'Accuracy',
+    titleTextStyle: {italic: false, bold: true}
+  },
+});
+
+print(chart);
+
+// Running with Optimal Parameter Selected from Grid Search
+var rf={
+  numberOfTrees:500,
+  seed:123,
+  variablesPerSplit:3,
+  maxNodes:51
+}
+var rf_classifier = ee.Classifier.smileRandomForest(rf)
+    .train({
+      features: trainImage,
+      classProperty: label,
+      inputProperties: bands
+    });
+    
+// Classifying the Image
+var rf_classified = input.classify(rf_classifier).rename('rf');
+
+// Visualizing the Classified Image
+Map.addLayer(rf_classified, {palette: landcoverPalette, min: 0, max:5 }, 'rf_classifed');
+Map.centerObject(aoi)
+
+// //// ACCURACY ASSESSMENT //// //
+
+// Classifying the Training And Testing Dataset and Getting Confusion Matrix
+
+var confusionMatrix_train = ee.ConfusionMatrix(trainImage.classify(rf_classifier)
+    .errorMatrix({
+      actual: 'Class', 
+      predicted: 'classification'
+    }));
+    
+var confusionMatrix_test = ee.ConfusionMatrix(testImage.classify(rf_classifier)
+    .errorMatrix({
+      actual: 'Class', 
+      predicted: 'classification'
+    }));
+
+print('Confusion matrix train:', confusionMatrix_train);
+print('Kappa Coefficient train:', confusionMatrix_train.kappa())
+print('Overall Accuracy train:', confusionMatrix_train.accuracy());
+print('Producers Accuracy train:', confusionMatrix_train.producersAccuracy());
+print('Consumers Accuracy train:', confusionMatrix_train.consumersAccuracy());
+
+print('Confusion matrix test:', confusionMatrix_test);
+print('Kappa Coefficient test:', confusionMatrix_test.kappa())
+print('Overall Accuracy test:', confusionMatrix_test.accuracy());
+print('Producers Accuracy test:', confusionMatrix_test.producersAccuracy());
+print('Consumers Accuracy test:', confusionMatrix_test.consumersAccuracy());
+print(confusionMatrix_train.array().toList().flatten());
+
+
+var classified_final = rf_classified.remap([0,1,2,3,4,5],[1,2,3,4,5,6])
+print(classified_final)
+
+var Accuracy_train = ee.Feature(null, {
+  kappa: confusionMatrix_train.kappa(),
+  overall: confusionMatrix_train.accuracy(), 
+  producers_accuracy:confusionMatrix_train.producersAccuracy(), 
+  consumers_accuracy: confusionMatrix_train.consumersAccuracy()
+})
+
+var CfMatrix_train = ee.Feature(null, {
+  0: ee.List(confusionMatrix_train.array().toList().get(0)),
+  1: ee.List(confusionMatrix_train.array().toList().get(1)),
+  2: ee.List(confusionMatrix_train.array().toList().get(2)),
+  3: ee.List(confusionMatrix_train.array().toList().get(3)),
+  4: ee.List(confusionMatrix_train.array().toList().get(4)),
+  5: ee.List(confusionMatrix_train.array().toList().get(5))
+})
+
+var CfMatrix_test = ee.Feature(null, {
+  0: ee.List(confusionMatrix_test.array().toList().get(0)),
+  1: ee.List(confusionMatrix_test.array().toList().get(1)),
+  2: ee.List(confusionMatrix_test.array().toList().get(2)),
+  3: ee.List(confusionMatrix_test.array().toList().get(3)),
+  4: ee.List(confusionMatrix_test.array().toList().get(4)),
+  5: ee.List(confusionMatrix_test.array().toList().get(5))
+})
+
+var Accuracy_test = ee.Feature(null, {
+  kappa: confusionMatrix_test.kappa(),
+  overall: confusionMatrix_test.accuracy(), 
+  producers_accuracy:confusionMatrix_test.producersAccuracy().toList().flatten(), 
+  consumers_accuracy: confusionMatrix_test.consumersAccuracy().toList().flatten()
+})
+
+// Exporting the Train Accuracy Metrics
+Export.table.toDrive({
+  collection: ee.FeatureCollection(CfMatrix_test),
+  folder:"LULC",
+  description: 'Matrix_test_RF',
+  fileFormat: 'CSV'
+});
+
+Export.table.toDrive({
+  collection: ee.FeatureCollection(CfMatrix_train),
+  folder:"LULC",
+  description: 'Matrix_train_RF',
+  fileFormat: 'CSV'
+});
+
+// // Exporting the Test Accuracy Metrics.
+Export.table.toDrive({
+  collection: ee.FeatureCollection(Accuracy_train),
+  folder:"LULC",
+  description: 'Accuracy_train_RF',
+  fileFormat: 'CSV'
+});
+
+Export.table.toDrive({
+  collection: ee.FeatureCollection(Accuracy_test),
+  folder:"LULC",
+  description: 'Accuracy_test_RF',
+  fileFormat: 'CSV'
+});
+
+// Exporting the Classified Map to Google Drive
+Export.image.toDrive({
+  image: classified_final,
+  description: 'LULC_RF',
+  scale: 30,
+  folder:'LULC',
+  region: aoi,
+  maxPixels: 1e12,
+});
+
+
+//////////////////////    SVM CLASSIFIER   ///////////////////////
+
+//// Tuning Hyperparameter //// 
+
+// Defining the Parameters C and gamma (g)
+var exp=ee.List.sequence(1, 20, 1);
+var c=exp.map(function(exponent){
+  return ee.Number(2).pow(exponent);
+})
+var g=ee.List.sequence(0.5,1,0.055)
+
+// Getting the Results of Grid Search
+var results_svm=c.map(function(el_c){
+return g.map(function(el_g){
+  var svm_par={
+  kernelType: "RBF",
+  gamma: el_g,
+  cost: el_c
+}
+var svmClassifier = ee.Classifier.libsvm(svm_par).train({
+  features: trainImage,
+  classProperty: label,
+  inputProperties: bands
+});
+var svm_classified = input.classify(svmClassifier);
+var confusionMatrix_train = ee.ConfusionMatrix(trainImage.classify(svmClassifier)
+    .errorMatrix({
+      actual: 'Class', 
+      predicted: 'classification'
+    }));
+var confusionMatrix_val = ee.ConfusionMatrix(validationImage.classify(svmClassifier)
+    .errorMatrix({
+      actual: 'Class', 
+      predicted: 'classification'
+    }));
+    return ee.Dictionary({'cost':el_c,'gamma':el_g,'accuracy_val':confusionMatrix_val.accuracy(),'accuracy_train':confusionMatrix_train.accuracy()});
+  }) 
+}).flatten()
+
+function extr_val(d,k){return d.values([k]).get(0)}
+
+// Visualizing the Accuracy Results
+var acc_train=results_svm.map(function(e){
+  var d=ee.Dictionary(e)
+  return extr_val(d,'accuracy_train')
+})
+var acc_val=results_svm.map(function(e){
+  var d=ee.Dictionary(e)
+  return extr_val(d,'accuracy_val')
+})
+var acc=ee.Array([acc_train,acc_val])
+var gamma=results_svm.map(function(e){
+  var d=ee.Dictionary(e)
+  return extr_val(d,'gamma')
+})
+var cost=results_svm.map(function(e){
+  var d=ee.Dictionary(e)
+  return extr_val(d,'cost')
+})
+var params=ee.Array([cost,gamma])
+var chart = ui.Chart.array.values({array: acc, axis: 1, xLabels: cost})
+.setChartType('LineChart')
+.setSeriesNames(['Train','Validation'])
+.setOptions({
+  title: 'Cost and Accuracy',
+  hAxis: {
+    title: 'Cost',
+    titleTextStyle: {italic: false, bold: true}
+  },
+  vAxis: {
+    title: 'Accuracy',
+    titleTextStyle: {italic: false, bold: true}
+  },
+});
+print(chart);
+
+
+// Running with Optimal Parameter Selected from Grid Search
+
+var svm_par={
+  kernelType: "RBF",
+  cost: 8,
+  gamma:0.555
+}
+
+var svmClassifier = ee.Classifier.libsvm(svm_par).train({
+  features: trainImage,
+  classProperty: label,
+  inputProperties: bands
+});
+
+var svm_classified = input.classify(svmClassifier).rename('svm');
+
+
+Map.addLayer(svm_classified, {palette: landcoverPalette, min: 0, max:5 }, 'svm classified');
+print(svmClassifier.explain())
+
+
+// //// ACCURACY ASSESSMENT //// //
+
+// Classifying the Training And Testing Dataset and Getting Confusion Matrix
+var confusionMatrix_train = ee.ConfusionMatrix(trainImage.classify(svmClassifier)
+    .errorMatrix({
+      actual: 'Class', 
+      predicted: 'classification'
+    }));
+    
+var confusionMatrix_test = ee.ConfusionMatrix(testImage.classify(svmClassifier)
+    .errorMatrix({
+      actual: 'Class', 
+      predicted: 'classification'
+    }));
+
+print('Confusion matrix train:', confusionMatrix_train);
+print('Kappa Coefficient train:', confusionMatrix_train.kappa())
+print('Overall Accuracy train:', confusionMatrix_train.accuracy());
+print('Producers Accuracy train:', confusionMatrix_train.producersAccuracy());
+print('Consumers Accuracy train:', confusionMatrix_train.consumersAccuracy());
+
+print('Confusion matrix test:', confusionMatrix_test);
+print('Kappa Coefficient test:', confusionMatrix_test.kappa())
+print('Overall Accuracy test:', confusionMatrix_test.accuracy());
+print('Producers Accuracy test:', confusionMatrix_test.producersAccuracy());
+print('Consumers Accuracy test:', confusionMatrix_test.consumersAccuracy());
+
+var classified_final = svm_classified.remap([0,1,2,3,4,5],[1,2,3,4,5,6])
+
+var Accuracy_train = ee.Feature(null, {
+  kappa: confusionMatrix_train.kappa(),
+  overall: confusionMatrix_train.accuracy(), 
+  producers_accuracy:confusionMatrix_train.producersAccuracy(), 
+  consumers_accuracy: confusionMatrix_train.consumersAccuracy()
+})
+var Accuracy_test = ee.Feature(null, {
+  kappa: confusionMatrix_test.kappa(),
+  overall: confusionMatrix_test.accuracy(), 
+  producers_accuracy:confusionMatrix_test.producersAccuracy(), 
+  consumers_accuracy: confusionMatrix_test.consumersAccuracy()
+})
+
+var CfMatrix_test = ee.Feature(null, {
+  0: ee.List(confusionMatrix_test.array().toList().get(0)),
+  1: ee.List(confusionMatrix_test.array().toList().get(1)),
+  2: ee.List(confusionMatrix_test.array().toList().get(2)),
+  3: ee.List(confusionMatrix_test.array().toList().get(3)),
+  4: ee.List(confusionMatrix_test.array().toList().get(4)),
+  5: ee.List(confusionMatrix_test.array().toList().get(5))
+})
+var CfMatrix_train = ee.Feature(null, {
+  0: ee.List(confusionMatrix_train.array().toList().get(0)),
+  1: ee.List(confusionMatrix_train.array().toList().get(1)),
+  2: ee.List(confusionMatrix_train.array().toList().get(2)),
+  3: ee.List(confusionMatrix_train.array().toList().get(3)),
+  4: ee.List(confusionMatrix_train.array().toList().get(4)),
+  5: ee.List(confusionMatrix_train.array().toList().get(5))
+})
+
+// Exporting the Accuracy Metrics.
+Export.table.toDrive({
+  collection: ee.FeatureCollection(Accuracy_train),
+  folder:"LULC",
+  description: 'Accuracy_train_svm',
+  fileFormat: 'CSV'
+});
+
+Export.table.toDrive({
+  collection: ee.FeatureCollection(Accuracy_test),
+  folder:"LULC",
+  description: 'Accuracy_test_svm',
+  fileFormat: 'CSV'
+});
+
+Export.table.toDrive({
+  collection: ee.FeatureCollection(CfMatrix_train),
+  folder:"LULC",
+  description: 'Matrix_train_svm',
+  fileFormat: 'CSV'
+});
+
+Export.table.toDrive({
+  collection: ee.FeatureCollection(CfMatrix_test),
+  folder:"LULC",
+  description: 'Matrix_test_svm',
+  fileFormat: 'CSV'
+});
+
+// Export classified map to Google Drive
+Export.image.toDrive({
+  image: classified_final,
+  description: 'LULC_svm_2011',
+  scale: 30,
+  folder:'LULC',
+  region: aoi,
+  maxPixels: 1e12,
+});
+
+
+//////////////////////    SVM CLASSIFIER   ///////////////////////
+
+//Tuning Hyperparameter
+
+// Defining the Parameter
+var maxN=ee.List.sequence(2,100,1)
+
+// Getting the Results of Grid Search
+var results_cart=maxN.map(function(e){
+var cart_par={
+  maxNodes:e
+}
+var cart_classifier = ee.Classifier.smileCart(cart_par)
+    .train({
+      features: trainImage,
+      classProperty: label,
+      inputProperties: bands
+    });
+var rf_classified = input.classify(cart_classifier);
+var confusionMatrix_train = ee.ConfusionMatrix(trainImage.classify(cart_classifier)
+    .errorMatrix({
+      actual: 'Class', 
+      predicted: 'classification'
+    }));
+var confusionMatrix_val = ee.ConfusionMatrix(validationImage.classify(cart_classifier)
+    .errorMatrix({
+      actual: 'Class', 
+      predicted: 'classification'
+    }));    
+return ee.Dictionary({'maximum nodes':e,'accuracy_val':confusionMatrix_val.accuracy(),'accuracy_train':confusionMatrix_train.accuracy()});
+}).flatten()
+
+function extr_val(d,k){return d.values([k]).get(0)}
+
+// Visualizing the Accuracy Results
+var acc_train=results_cart.map(function(e){
+  var d=ee.Dictionary(e)
+  return extr_val(d,'accuracy_train')
+})
+var acc_val=results_cart.map(function(e){
+  var d=ee.Dictionary(e)
+  return extr_val(d,'accuracy_val')
+})
+var acc=ee.Array([acc_train,acc_val])
+var node=results_cart.map(function(e){
+  var d=ee.Dictionary(e)
+  return extr_val(d,'maximum nodes')
+})
+var chart = ui.Chart.array.values({array: acc, axis: 1, xLabels: node})
+.setChartType('LineChart')
+.setSeriesNames(['Train','Validation'])
+.setOptions({
+  title: 'Max Node and Accuracy',
+  hAxis: {
+    title: 'Max Node',
+    titleTextStyle: {italic: false, bold: true}
+  },
+  vAxis: {
+    title: 'Accuracy',
+    titleTextStyle: {italic: false, bold: true}
+  },
+});
+print(chart);
+
+// Running with Optimal Parameter Selected from Grid Search
+var cart_par={
+maxNodes:36
+}
+
+var cartClassifier = ee.Classifier.smileCart(cart_par).train({
+  features: trainImage,
+  classProperty: label,
+  inputProperties: bands
+});
+
+var cart_classified = input.classify(cartClassifier).rename('cart');
+
+
+Map.addLayer(cart_classified, {palette: landcoverPalette, min: 0, max:5 }, 'cart classified');
+print(svmClassifier.explain())
+
+
+// //// ACCURACY ASSESSMENT //// //
+
+// Classifying the Training And Testing Dataset and Getting Confusion Matrix
+var confusionMatrix_train = ee.ConfusionMatrix(trainImage.classify(cartClassifier)
+    .errorMatrix({
+      actual: 'Class', 
+      predicted: 'classification'
+    }));
+    
+var confusionMatrix_test = ee.ConfusionMatrix(testImage.classify(cartClassifier)
+    .errorMatrix({
+      actual: 'Class', 
+      predicted: 'classification'
+    }));
+
+print('Confusion matrix train:', confusionMatrix_train);
+print('Kappa Coefficient train:', confusionMatrix_train.kappa())
+print('Overall Accuracy train:', confusionMatrix_train.accuracy());
+print('Producers Accuracy train:', confusionMatrix_train.producersAccuracy());
+print('Consumers Accuracy train:', confusionMatrix_train.consumersAccuracy());
+
+print('Confusion matrix test:', confusionMatrix_test);
+print('Kappa Coefficient test:', confusionMatrix_test.kappa())
+print('Overall Accuracy test:', confusionMatrix_test.accuracy());
+print('Producers Accuracy test:', confusionMatrix_test.producersAccuracy());
+print('Consumers Accuracy test:', confusionMatrix_test.consumersAccuracy());
+
+
+var classified_final = cart_classified.remap([0,1,2,3,4,5],[1,2,3,4,5,6])
+
+var Accuracy_train = ee.Feature(null, {
+  kappa: confusionMatrix_train.kappa(),
+  overall: confusionMatrix_train.accuracy(), 
+  producers_accuracy:confusionMatrix_train.producersAccuracy(), 
+  consumers_accuracy: confusionMatrix_train.consumersAccuracy()
+})
+
+var Accuracy_test = ee.Feature(null, {
+  kappa: confusionMatrix_test.kappa(),
+  overall: confusionMatrix_test.accuracy(), 
+  producers_accuracy:confusionMatrix_test.producersAccuracy(), 
+  consumers_accuracy: confusionMatrix_test.consumersAccuracy()
+});
+
+var CfMatrix_test = ee.Feature(null, {
+  0: ee.List(confusionMatrix_test.array().toList().get(0)),
+  1: ee.List(confusionMatrix_test.array().toList().get(1)),
+  2: ee.List(confusionMatrix_test.array().toList().get(2)),
+  3: ee.List(confusionMatrix_test.array().toList().get(3)),
+  4: ee.List(confusionMatrix_test.array().toList().get(4)),
+  5: ee.List(confusionMatrix_test.array().toList().get(5))
+});
+
+var CfMatrix_train = ee.Feature(null, {
+  0: ee.List(confusionMatrix_train.array().toList().get(0)),
+  1: ee.List(confusionMatrix_train.array().toList().get(1)),
+  2: ee.List(confusionMatrix_train.array().toList().get(2)),
+  3: ee.List(confusionMatrix_train.array().toList().get(3)),
+  4: ee.List(confusionMatrix_train.array().toList().get(4)),
+  5: ee.List(confusionMatrix_train.array().toList().get(5))
+});
+
+// // Export the Accuracy Metrics.
+Export.table.toDrive({
+  collection: ee.FeatureCollection(Accuracy_train),
+  folder:"LULC",
+  description: 'Accuracy_train_cart_2011',
+  fileFormat: 'CSV'
+});
+Export.table.toDrive({
+  collection: ee.FeatureCollection(Accuracy_test),
+  folder:"LULC",
+  description: 'Accuracy_test_cart_2011',
+  fileFormat: 'CSV'
+});
+Export.table.toDrive({
+  collection: ee.FeatureCollection(CfMatrix_test),
+  folder:"LULC",
+  description: 'Matrix_test_cart_2011',
+  fileFormat: 'CSV'
+});
+Export.table.toDrive({
+  collection: ee.FeatureCollection(CfMatrix_train),
+  folder:"LULC",
+  description: 'Matrix_train_cart_2011',
+  fileFormat: 'CSV'
+});
+
+//Export classified map to Google Drive
+Export.image.toDrive({
+  image: classified_final,
+  description: 'LULC_cart_2011',
+  scale: 30,
+  folder:'LULC',
+  region: aoi,
+  maxPixels: 1e12,
+});
+
