@@ -1,6 +1,6 @@
 ## Mapping Urban Heterogeneous Landscapes using ML Algorithms in Google Earth Engine
 
-This javascript Google Earth Engine code is part of our research <b>Evaluating machine learning algorithms for classifying urban heterogeneous landscapes using GEE</b> published as a Book Chapter.
+This Google Earth Engine code (javascript-based) is part of our research <b>Evaluating machine learning algorithms for classifying urban heterogeneous landscapes using GEE</b> published as a Book Chapter.
 
 <a href="https://code.earthengine.google.com/
 0e9ec3f72308aaf933db1d42ff00ad29?noload¼true">Click Here to open the code in Google Earth Engine </a>
