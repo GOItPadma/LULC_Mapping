@@ -3,7 +3,7 @@
 This Google Earth Engine code is part of our research <b>Evaluating machine learning algorithms for classifying urban heterogeneous landscapes using GEE</b> published as a Book Chapter, where we utilized RF, SVM and CART algorithms to classify Landsat Images into six urban land cover features. <br> <br>
 <b>Supervisor</b>: <a href="https://www.du.ac.bd/body/faculty_details/GEN/2531">Nazmoon Nahar Sumiya</a>, Assistant Professor, Department of Geography and Environment, University of Dhaka, Bangladesh.
 
-### Flowchart of The Study
+### Flowchart of the Study
 <img src="Images/Fig_2 (Methodological Flowchart Followed in this Study).png" height = 480/>
 
 ### LULC Map for Landsat - 8
